@@ -26,7 +26,7 @@ import {
   shouldSuppressInheritedTerminalStatus
 } from '../../../../shared/agent-status-identity'
 import { isCommandCodeNewTurnWhileWorking } from '../../../../shared/command-code-turn-boundary'
-import type { TerminalTab } from '../../../../shared/types'
+import type { TerminalPaneLayoutNode, TerminalTab } from '../../../../shared/types'
 import { isExplicitAgentStatusFresh } from '@/lib/agent-status'
 import {
   getAgentRowGeneratedTitleText,
@@ -262,6 +262,97 @@ function capRetainedAgents(
     capped[key] = retained[key]
   }
   return capped
+}
+
+// Why: live entries are heavy (~60KB max) and leak on long sessions when panes vanish without a
+// teardown event (#9872, live-map sibling of the #7528 retained-map leak); cap the map by shedding
+// rows whose pane is provably gone (or long idle). A missed teardown can strand a row in ANY state,
+// so eviction keys off pane liveness, not 'done'-ness — otherwise the map stays unbounded.
+export const MAX_LIVE_AGENT_STATUSES = 500
+
+type PaneLiveness = 'live' | 'dead' | 'unprovable'
+
+// Why: eviction may only touch a row whose pane is PROVABLY gone. A mounted tab has a rooted layout
+// that enumerates every live leaf, so a leaf missing from it is provably 'dead'. Any other tab — a
+// rootless/empty snapshot (kept by inactive worktrees while the tab + PTY stay live, #2962), a
+// not-yet-hydrated tab, or a runtime-attributed row with no renderer tab (orchestration workers) —
+// can't prove leaf death; such rows are 'unprovable' and are only shed once idle past the stale
+// window (or by the hard-cap fallback), never while a fresh live agent could still own them.
+function classifyPaneKeyLiveness(state: AppState): (paneKey: string) => PaneLiveness {
+  const rootedLeafKeys = new Set<string>()
+  const rootedTabIds = new Set<string>()
+  for (const [tabId, layout] of Object.entries(state.terminalLayoutsByTabId)) {
+    if (!layout?.root) {
+      continue
+    }
+    rootedTabIds.add(tabId)
+    const stack: TerminalPaneLayoutNode[] = [layout.root]
+    while (stack.length > 0) {
+      const node = stack.pop()!
+      if (node.type === 'leaf') {
+        rootedLeafKeys.add(`${tabId}:${node.leafId}`)
+      } else {
+        stack.push(node.first, node.second)
+      }
+    }
+  }
+  return (paneKey) => {
+    if (rootedLeafKeys.has(paneKey)) {
+      return 'live'
+    }
+    const tabId = getTabIdFromPaneKey(paneKey)
+    return tabId !== null && rootedTabIds.has(tabId) ? 'dead' : 'unprovable'
+  }
+}
+
+// Why: mutates `freshLive` in place — caller passes a freshly spread map no consumer has seen, so
+// eviction adds no second full-map copy on the ping hot path. `buildClassifier` is invoked lazily only
+// when over cap. Never evicts a live pane's row (any state, incl. needs-input 'waiting'/'blocked');
+// only orphans (pane gone or long idle) are evictable. Returns whether anything was evicted (caller
+// bumps epochs so the sidebar re-renders and the retention sync snapshots disappeared rows).
+function capLiveAgentStatusesInPlace(
+  freshLive: Record<string, AgentStatusEntry>,
+  protectedPaneKey: string,
+  buildClassifier: () => (paneKey: string) => PaneLiveness,
+  now: number,
+  maxEntries = MAX_LIVE_AGENT_STATUSES
+): boolean {
+  const keys = Object.keys(freshLive)
+  let overflow = keys.length - maxEntries
+  if (overflow <= 0) {
+    return false
+  }
+  const classify = buildClassifier()
+  let evicted = false
+  const sweep = (canEvict: (liveness: PaneLiveness, entry: AgentStatusEntry) => boolean): void => {
+    for (const key of keys) {
+      if (overflow <= 0) {
+        break
+      }
+      if (key === protectedPaneKey || !(key in freshLive)) {
+        continue
+      }
+      const liveness = classify(key)
+      // Never evict an open pane's row, even when its agent is idle.
+      if (liveness === 'live' || !canEvict(liveness, freshLive[key])) {
+        continue
+      }
+      delete freshLive[key]
+      overflow -= 1
+      evicted = true
+    }
+  }
+  // Provably-dead panes (any age) and orphans idle past the stale window — safe to shed first.
+  sweep(
+    (liveness, entry) => liveness === 'dead' || now - entry.updatedAt > AGENT_STATUS_STALE_AFTER_MS
+  )
+  // Hard cap: a burst of fresh unprovable rows (startup replay, or a >500-worker orchestration swarm)
+  // must not defeat the bound — shed the oldest regardless. Open panes stay untouched, so if this
+  // still can't reach the cap it means >500 genuinely-live panes exist (soft cap).
+  if (overflow > 0) {
+    sweep(() => true)
+  }
+  return evicted
 }
 
 function paneKeyMatchesAnyTabPrefix(paneKey: string, tabPrefixes: string[]): boolean {
@@ -1879,19 +1970,29 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
           nextSleepingAgentSessions = { ...s.sleepingAgentSessionsByPaneKey }
           delete nextSleepingAgentSessions[paneKey]
         }
+        const nextLive = { ...s.agentStatusByPaneKey, [paneKey]: entry }
+        // Why: cap the live map so a huge map's per-ping spread copy can't OOM the renderer (#9872).
+        const evictedOrphans = capLiveAgentStatusesInPlace(
+          nextLive,
+          paneKey,
+          () => classifyPaneKeyLiveness(s),
+          updatedAt
+        )
         return {
-          agentStatusByPaneKey: { ...s.agentStatusByPaneKey, [paneKey]: entry },
+          agentStatusByPaneKey: nextLive,
           retainedAgentsByPaneKey: nextRetainedAgents,
           sleepingAgentSessionsByPaneKey: nextSleepingAgentSessions,
           agentLaunchConfigByPaneKey: nextLaunchConfigs,
           migrationUnsupportedByPtyId: migrationUnsupported.next,
           retentionSuppressedPaneKeys: nextRetentionSuppressedPaneKeys,
           agentStatusEpoch:
-            retentionRelevantChange || migrationUnsupported.changed
+            retentionRelevantChange || migrationUnsupported.changed || evictedOrphans
               ? s.agentStatusEpoch + 1
               : s.agentStatusEpoch,
           sortEpoch:
-            sortRelevantChange || migrationUnsupported.changed ? s.sortEpoch + 1 : s.sortEpoch
+            sortRelevantChange || migrationUnsupported.changed || evictedOrphans
+              ? s.sortEpoch + 1
+              : s.sortEpoch
         }
       })
       if (suppressedInheritedTerminalStatus) {
